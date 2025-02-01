@@ -7,7 +7,7 @@ pub mod instruction;
 pub mod utils;
 
 use anchor_client::{
-    solana_client::rpc_client::RpcClient,
+    solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::{
         commitment_config::CommitmentConfig,
         pubkey::Pubkey,
@@ -22,8 +22,8 @@ use anchor_spl::associated_token::{
 };
 use borsh::BorshDeserialize;
 pub use pumpfun_cpi as cpi;
-use solana_sdk::compute_budget::ComputeBudgetInstruction;
-use std::rc::Rc;
+use solana_sdk::{compute_budget::ComputeBudgetInstruction, transaction::Transaction};
+use std::{rc::Rc, sync::Arc};
 
 /// Configuration for priority fee compute unit parameters
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,11 +37,9 @@ pub struct PriorityFee {
 /// Main client for interacting with the Pump.fun program
 pub struct PumpFun<'a> {
     /// RPC client for Solana network requests
-    pub rpc: RpcClient,
+    pub rpc: Arc<RpcClient>,
     /// Keypair used to sign transactions
     pub payer: &'a Keypair,
-    /// Anchor client instance
-    pub client: Client<Rc<&'a Keypair>>,
     /// Anchor program instance
     pub program: Program<Rc<&'a Keypair>>,
 }
@@ -66,11 +64,11 @@ impl<'a> PumpFun<'a> {
         ws: Option<bool>,
     ) -> Self {
         // Create Solana RPC Client with either WS or HTTP endpoint
-        let rpc: RpcClient = RpcClient::new(if ws.unwrap_or(false) {
-            cluster.ws_url()
+        let rpc: Arc<RpcClient> = Arc::new(RpcClient::new(if ws.unwrap_or(false) {
+            cluster.ws_url().to_string()
         } else {
-            cluster.url()
-        });
+            cluster.url().to_string()
+        }));
 
         // Create Anchor Client with optional commitment config
         let client: Client<Rc<&Keypair>> = if let Some(options) = options {
@@ -86,7 +84,6 @@ impl<'a> PumpFun<'a> {
         Self {
             rpc,
             payer,
-            client,
             program,
         }
     }
@@ -178,7 +175,7 @@ impl<'a> PumpFun<'a> {
             .map_err(error::ClientError::UploadMetadataError)?;
 
         // Get accounts and calculate buy amounts
-        let global_account = self.get_global_account()?;
+        let global_account = self.get_global_account().await?;
         let buy_amount = global_account.get_initial_buy_price(amount_sol);
         let buy_amount_with_slippage =
             utils::calculate_with_slippage_buy(amount_sol, slippage_basis_points.unwrap_or(500));
@@ -211,7 +208,7 @@ impl<'a> PumpFun<'a> {
 
         // Create Associated Token Account if needed
         let ata: Pubkey = get_associated_token_address(&self.payer.pubkey(), &mint.pubkey());
-        if self.rpc.get_account(&ata).is_err() {
+        if self.rpc.get_account(&ata).await.is_err() {
             request = request.instruction(create_associated_token_account(
                 &self.payer.pubkey(),
                 &self.payer.pubkey(),
@@ -262,8 +259,8 @@ impl<'a> PumpFun<'a> {
         priority_fee: Option<PriorityFee>,
     ) -> Result<Signature, error::ClientError> {
         // Get accounts and calculate buy amounts
-        let global_account = self.get_global_account()?;
-        let bonding_curve_account = self.get_bonding_curve_account(mint)?;
+        let global_account = self.get_global_account().await?;
+        let bonding_curve_account = self.get_bonding_curve_account(mint).await?;
         let buy_amount = bonding_curve_account
             .get_buy_price(amount_sol)
             .map_err(error::ClientError::BondingCurveError)?;
@@ -287,7 +284,7 @@ impl<'a> PumpFun<'a> {
 
         // Create Associated Token Account if needed
         let ata: Pubkey = get_associated_token_address(&self.payer.pubkey(), mint);
-        if self.rpc.get_account(&ata).is_err() {
+        if self.rpc.get_account(&ata).await.is_err() {
             request = request.instruction(create_associated_token_account(
                 &self.payer.pubkey(),
                 &self.payer.pubkey(),
@@ -319,6 +316,82 @@ impl<'a> PumpFun<'a> {
         Ok(signature)
     }
 
+    /// make a buy op transaction
+    ///
+    /// # Arguments
+    ///
+    /// * `mint` - Public key of the token mint to buy
+    /// * `amount_sol` - Amount of SOL to spend in lamports
+    /// * `slippage_basis_points` - Optional maximum acceptable slippage in basis points (1 bp = 0.01%). Defaults to 500
+    /// * `priority_fee` - Optional priority fee configuration for compute units
+    ///
+    /// # Returns
+    ///
+    /// Returns the transaction
+    pub async fn make_buy_tx(
+        &self,
+        mint: &Pubkey,
+        amount_sol: u64,
+        slippage_basis_points: Option<u64>,
+        priority_fee: Option<PriorityFee>,
+    ) -> Result<Transaction, error::ClientError> {
+        // Get accounts and calculate buy amounts
+        let global_account = self.get_global_account().await?;
+        let bonding_curve_account = self.get_bonding_curve_account(mint).await?;
+        let buy_amount = bonding_curve_account
+            .get_buy_price(amount_sol)
+            .map_err(error::ClientError::BondingCurveError)?;
+        let buy_amount_with_slippage =
+            utils::calculate_with_slippage_buy(amount_sol, slippage_basis_points.unwrap_or(500));
+
+        let mut request = self.program.request();
+
+        // Add priority fee if provided
+        if let Some(fee) = priority_fee {
+            if let Some(limit) = fee.limit {
+                let limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(limit);
+                request = request.instruction(limit_ix);
+            }
+
+            if let Some(price) = fee.price {
+                let price_ix = ComputeBudgetInstruction::set_compute_unit_price(price);
+                request = request.instruction(price_ix);
+            }
+        }
+
+        // Create Associated Token Account if needed
+        let ata: Pubkey = get_associated_token_address(&self.payer.pubkey(), mint);
+        if self.rpc.get_account(&ata).await.is_err() {
+            request = request.instruction(create_associated_token_account(
+                &self.payer.pubkey(),
+                &self.payer.pubkey(),
+                mint,
+                &constants::accounts::TOKEN_PROGRAM,
+            ));
+        }
+
+        // Add buy instruction
+        request = request.instruction(instruction::buy(
+            self.payer,
+            mint,
+            &global_account.fee_recipient,
+            cpi::instruction::Buy {
+                _amount: buy_amount,
+                _max_sol_cost: buy_amount_with_slippage,
+            },
+        ));
+
+        // Add signer
+        request = request.signer(&self.payer);
+
+        // make transaction
+        let tx = request
+            .transaction()
+            .map_err(error::ClientError::ConvertTransactionError)?;
+
+        Ok(tx)
+    }
+
     /// Sells tokens back to the bonding curve in exchange for SOL
     ///
     /// # Arguments
@@ -340,11 +413,11 @@ impl<'a> PumpFun<'a> {
     ) -> Result<Signature, error::ClientError> {
         // Get accounts and calculate sell amounts
         let ata: Pubkey = get_associated_token_address(&self.payer.pubkey(), mint);
-        let balance = self.rpc.get_token_account_balance(&ata).unwrap();
+        let balance = self.rpc.get_token_account_balance(&ata).await.unwrap();
         let balance_u64: u64 = balance.amount.parse::<u64>().unwrap();
         let _amount = amount_token.unwrap_or(balance_u64);
-        let global_account = self.get_global_account()?;
-        let bonding_curve_account = self.get_bonding_curve_account(mint)?;
+        let global_account = self.get_global_account().await?;
+        let bonding_curve_account = self.get_bonding_curve_account(mint).await?;
         let min_sol_output = bonding_curve_account
             .get_sell_price(_amount, global_account.fee_basis_points)
             .map_err(error::ClientError::BondingCurveError)?;
@@ -389,6 +462,77 @@ impl<'a> PumpFun<'a> {
             .map_err(error::ClientError::AnchorClientError)?;
 
         Ok(signature)
+    }
+
+    /// make a sell op transaction
+    ///
+    /// # Arguments
+    ///
+    /// * `mint` - Public key of the token mint to sell
+    /// * `amount_token` - Optional amount of tokens to sell in base units. If None, sells entire balance
+    /// * `slippage_basis_points` - Optional maximum acceptable slippage in basis points (1 bp = 0.01%). Defaults to 500
+    /// * `priority_fee` - Optional priority fee configuration for compute units
+    ///
+    /// # Returns
+    ///
+    /// Returns the transaction
+    pub async fn make_sell_tx(
+        &self,
+        mint: &Pubkey,
+        amount_token: Option<u64>,
+        slippage_basis_points: Option<u64>,
+        priority_fee: Option<PriorityFee>,
+    ) -> Result<Transaction, error::ClientError> {
+        // Get accounts and calculate sell amounts
+        let ata: Pubkey = get_associated_token_address(&self.payer.pubkey(), mint);
+        let balance = self.rpc.get_token_account_balance(&ata).await.unwrap();
+        let balance_u64: u64 = balance.amount.parse::<u64>().unwrap();
+        let _amount = amount_token.unwrap_or(balance_u64);
+        let global_account = self.get_global_account().await?;
+        let bonding_curve_account = self.get_bonding_curve_account(mint).await?;
+        let min_sol_output = bonding_curve_account
+            .get_sell_price(_amount, global_account.fee_basis_points)
+            .map_err(error::ClientError::BondingCurveError)?;
+        let _min_sol_output = utils::calculate_with_slippage_sell(
+            min_sol_output,
+            slippage_basis_points.unwrap_or(500),
+        );
+
+        let mut request = self.program.request();
+
+        // Add priority fee if provided
+        if let Some(fee) = priority_fee {
+            if let Some(limit) = fee.limit {
+                let limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(limit);
+                request = request.instruction(limit_ix);
+            }
+
+            if let Some(price) = fee.price {
+                let price_ix = ComputeBudgetInstruction::set_compute_unit_price(price);
+                request = request.instruction(price_ix);
+            }
+        }
+
+        // Add sell instruction
+        request = request.instruction(instruction::sell(
+            self.payer,
+            mint,
+            &global_account.fee_recipient,
+            cpi::instruction::Sell {
+                _amount,
+                _min_sol_output,
+            },
+        ));
+
+        // Add signer
+        request = request.signer(&self.payer);
+
+        // make transaction
+        let tx = request
+            .transaction()
+            .map_err(error::ClientError::ConvertTransactionError)?;
+
+        Ok(tx)
     }
 
     /// Gets the Program Derived Address (PDA) for the global state account
@@ -453,12 +597,13 @@ impl<'a> PumpFun<'a> {
     /// # Returns
     ///
     /// Returns the deserialized GlobalAccount if successful, or a ClientError if the operation fails
-    pub fn get_global_account(&self) -> Result<accounts::GlobalAccount, error::ClientError> {
+    pub async fn get_global_account(&self) -> Result<accounts::GlobalAccount, error::ClientError> {
         let global: Pubkey = Self::get_global_pda();
 
         let account = self
             .rpc
             .get_account(&global)
+            .await
             .map_err(error::ClientError::SolanaClientError)?;
 
         accounts::GlobalAccount::try_from_slice(&account.data)
@@ -474,7 +619,7 @@ impl<'a> PumpFun<'a> {
     /// # Returns
     ///
     /// Returns the deserialized BondingCurveAccount if successful, or a ClientError if the operation fails
-    pub fn get_bonding_curve_account(
+    pub async fn get_bonding_curve_account(
         &self,
         mint: &Pubkey,
     ) -> Result<accounts::BondingCurveAccount, error::ClientError> {
@@ -484,6 +629,7 @@ impl<'a> PumpFun<'a> {
         let account = self
             .rpc
             .get_account(&bonding_curve_pda)
+            .await
             .map_err(error::ClientError::SolanaClientError)?;
 
         accounts::BondingCurveAccount::try_from_slice(&account.data)

@@ -2565,6 +2565,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "my_pumpfun"
+version = "2.0.2"
+dependencies = [
+ "anchor-client",
+ "anchor-spl",
+ "borsh 1.5.3",
+ "isahc",
+ "mpl-token-metadata",
+ "pumpfun-cpi",
+ "serde",
+ "serde_json",
+ "solana-sdk",
+ "tokio",
+]
+
+[[package]]
 name = "nix"
 version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3042,22 +3058,6 @@ dependencies = [
  "syn 1.0.109",
  "version_check",
  "yansi",
-]
-
-[[package]]
-name = "pumpfun"
-version = "2.0.2"
-dependencies = [
- "anchor-client",
- "anchor-spl",
- "borsh 1.5.3",
- "isahc",
- "mpl-token-metadata",
- "pumpfun-cpi",
- "serde",
- "serde_json",
- "solana-sdk",
- "tokio",
 ]
 
 [[package]]

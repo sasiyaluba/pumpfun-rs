@@ -42,6 +42,8 @@ pub enum ClientError {
     SimulationError(String),
     /// Rate limit exceeded
     RateLimitExceeded,
+    /// transfer transaction error
+    ConvertTransactionError(anchor_client::ClientError),
 }
 
 impl std::fmt::Display for ClientError {
@@ -57,6 +59,9 @@ impl std::fmt::Display for ClientError {
             Self::InsufficientFunds => write!(f, "Insufficient funds for transaction"),
             Self::SimulationError(msg) => write!(f, "Transaction simulation failed: {}", msg),
             Self::RateLimitExceeded => write!(f, "Rate limit exceeded"),
+            Self::ConvertTransactionError(err) => {
+                write!(f, "request convert transaction error: {}", err)
+            }
         }
     }
 }

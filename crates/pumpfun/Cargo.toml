@@ -1,5 +1,5 @@
 [package]
-name = "pumpfun"
+name = "my_pumpfun"
 version = "2.0.2"
 edition = "2021"
 authors = ["Rapheal Bamidele <nhuxhr@gmail.com>"]
