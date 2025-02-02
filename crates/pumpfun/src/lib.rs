@@ -7,7 +7,11 @@ pub mod instruction;
 pub mod utils;
 
 use anchor_client::{
-    solana_client::nonblocking::rpc_client::RpcClient,
+    solana_client::{
+        nonblocking::rpc_client::RpcClient,
+        rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
+        rpc_response::{Response, RpcSimulateTransactionResult},
+    },
     solana_sdk::{
         commitment_config::CommitmentConfig,
         pubkey::Pubkey,
@@ -239,6 +243,101 @@ impl PumpFun {
         Ok(signature)
     }
 
+    /// Creates a new token and immediately buys an initial amount in a single atomic transaction
+    ///
+    /// # Arguments
+    ///
+    /// * `mint` - Keypair for the new token mint
+    /// * `metadata` - Token metadata to upload to IPFS
+    /// * `amount_sol` - Amount of SOL to spend on initial buy in lamports
+    /// * `slippage_basis_points` - Optional maximum acceptable slippage in basis points (1 bp = 0.01%). Defaults to 500
+    /// * `priority_fee` - Optional priority fee configuration for compute units
+    ///
+    /// # Returns
+    ///
+    /// Returns the transaction signature if successful, or a ClientError if the operation fails
+    pub async fn simulate_create_and_buy(
+        &self,
+        mint: &Keypair,
+        metadata: utils::CreateTokenMetadata,
+        amount_sol: u64,
+        slippage_basis_points: Option<u64>,
+        priority_fee: Option<PriorityFee>,
+    ) -> Result<Response<RpcSimulateTransactionResult>, error::ClientError> {
+        // Upload metadata to IPFS first
+        let ipfs: utils::TokenMetadataResponse = utils::create_token_metadata(metadata)
+            .await
+            .map_err(error::ClientError::UploadMetadataError)?;
+
+        // Get accounts and calculate buy amounts
+        let global_account = self.get_global_account().await?;
+        let buy_amount = global_account.get_initial_buy_price(amount_sol);
+        let buy_amount_with_slippage =
+            utils::calculate_with_slippage_buy(amount_sol, slippage_basis_points.unwrap_or(500));
+
+        let mut request = self.program.request();
+
+        // Add priority fee if provided
+        if let Some(fee) = priority_fee {
+            if let Some(limit) = fee.limit {
+                let limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(limit);
+                request = request.instruction(limit_ix);
+            }
+
+            if let Some(price) = fee.price {
+                let price_ix = ComputeBudgetInstruction::set_compute_unit_price(price);
+                request = request.instruction(price_ix);
+            }
+        }
+
+        // Add create token instruction
+        request = request.instruction(instruction::create(
+            self.payer,
+            mint,
+            cpi::instruction::Create {
+                _name: ipfs.metadata.name,
+                _symbol: ipfs.metadata.symbol,
+                _uri: ipfs.metadata.image,
+            },
+        ));
+
+        // Create Associated Token Account if needed
+        let ata: Pubkey = get_associated_token_address(&self.payer.pubkey(), &mint.pubkey());
+        if self.rpc.get_account(&ata).await.is_err() {
+            request = request.instruction(create_associated_token_account(
+                &self.payer.pubkey(),
+                &self.payer.pubkey(),
+                &mint.pubkey(),
+                &constants::accounts::TOKEN_PROGRAM,
+            ));
+        }
+
+        // Add buy instruction
+        request = request.instruction(instruction::buy(
+            self.payer,
+            &mint.pubkey(),
+            &global_account.fee_recipient,
+            cpi::instruction::Buy {
+                _amount: buy_amount,
+                _max_sol_cost: buy_amount_with_slippage,
+            },
+        ));
+
+        let response = self
+            .rpc
+            .simulate_transaction_with_config(
+                &request.transaction().unwrap(),
+                RpcSimulateTransactionConfig {
+                    commitment: Some(CommitmentConfig::finalized()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| error::ClientError::SimulationError(e.to_string()))?;
+
+        Ok(response)
+    }
+
     /// Buys tokens from a bonding curve by spending SOL
     ///
     /// # Arguments
@@ -316,7 +415,7 @@ impl PumpFun {
         Ok(signature)
     }
 
-    /// make a buy op transaction
+    /// simulate!!! Buys tokens from a bonding curve by spending SOL
     ///
     /// # Arguments
     ///
@@ -327,14 +426,14 @@ impl PumpFun {
     ///
     /// # Returns
     ///
-    /// Returns the transaction
-    pub async fn make_buy_tx(
+    /// Returns the transaction signature if successful, or a ClientError if the operation fails
+    pub async fn simulate_buy(
         &self,
         mint: &Pubkey,
         amount_sol: u64,
         slippage_basis_points: Option<u64>,
         priority_fee: Option<PriorityFee>,
-    ) -> Result<Transaction, error::ClientError> {
+    ) -> Result<Response<RpcSimulateTransactionResult>, error::ClientError> {
         // Get accounts and calculate buy amounts
         let global_account = self.get_global_account().await?;
         let bonding_curve_account = self.get_bonding_curve_account(mint).await?;
@@ -384,12 +483,19 @@ impl PumpFun {
         // Add signer
         request = request.signer(&self.payer);
 
-        // make transaction
-        let tx = request
-            .transaction()
-            .map_err(error::ClientError::ConvertTransactionError)?;
+        let response = self
+            .rpc
+            .simulate_transaction_with_config(
+                &request.transaction().unwrap(),
+                RpcSimulateTransactionConfig {
+                    commitment: Some(CommitmentConfig::finalized()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| error::ClientError::SimulationError(e.to_string()))?;
 
-        Ok(tx)
+        Ok(response)
     }
 
     /// Sells tokens back to the bonding curve in exchange for SOL
@@ -464,7 +570,7 @@ impl PumpFun {
         Ok(signature)
     }
 
-    /// make a sell op transaction
+    /// Sells tokens back to the bonding curve in exchange for SOL
     ///
     /// # Arguments
     ///
@@ -475,14 +581,14 @@ impl PumpFun {
     ///
     /// # Returns
     ///
-    /// Returns the transaction
-    pub async fn make_sell_tx(
+    /// Returns the transaction signature if successful, or a ClientError if the operation fails
+    pub async fn simulate_sell(
         &self,
         mint: &Pubkey,
         amount_token: Option<u64>,
         slippage_basis_points: Option<u64>,
         priority_fee: Option<PriorityFee>,
-    ) -> Result<Transaction, error::ClientError> {
+    ) -> Result<Response<RpcSimulateTransactionResult>, error::ClientError> {
         // Get accounts and calculate sell amounts
         let ata: Pubkey = get_associated_token_address(&self.payer.pubkey(), mint);
         let balance = self.rpc.get_token_account_balance(&ata).await.unwrap();
@@ -527,12 +633,19 @@ impl PumpFun {
         // Add signer
         request = request.signer(&self.payer);
 
-        // make transaction
-        let tx = request
-            .transaction()
-            .map_err(error::ClientError::ConvertTransactionError)?;
+        let response = self
+            .rpc
+            .simulate_transaction_with_config(
+                &request.transaction().unwrap(),
+                RpcSimulateTransactionConfig {
+                    commitment: Some(CommitmentConfig::finalized()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| error::ClientError::SimulationError(e.to_string()))?;
 
-        Ok(tx)
+        Ok(response)
     }
 
     /// Gets the Program Derived Address (PDA) for the global state account
